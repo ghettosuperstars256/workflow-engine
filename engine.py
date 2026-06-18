@@ -206,8 +206,7 @@ def action_delay(params, data):
 
 
 def action_code(params, data):
-    """Transform data using safe expression mapping (no exec/eval)."""
-    # Safe operations only: get, set, filter, map, join, split, upper, lower, strip
+    """Transform data using safe expression mapping (NO eval/exec)."""
     code = params.get("code", "")
     if not code:
         return data
@@ -219,56 +218,126 @@ def action_code(params, data):
         return {"error": str(e)}
 
 
-# Safe transform operations — NO exec/eval
-_SAFE_OPS = {
-    "upper": str.upper,
-    "lower": str.lower,
-    "strip": str.strip,
-    "title": str.title,
-    "len": len,
-    "str": str,
-    "int": int,
-    "float": float,
-    "bool": bool,
-    "list": list,
-    "dict": dict,
-    "sorted": sorted,
-    "reversed": list,  # reversed() returns iterator, wrap in list
-    "sum": sum,
-    "min": min,
-    "max": max,
-    "abs": abs,
-    "round": round,
-}
-
+# ─── Safe Expression Evaluator ──────────────────────────────
+# NO eval(), NO exec(). Pure Python string/number operations only.
 
 def _safe_transform(code, data):
-    """Apply safe data transformations. Code format: 'field.operation(args)'"""
+    """Apply safe data transformations.
+    Supported: result = field | field.upper | field.lower | field.strip |
+                field.title | len(field) | int(field) | str(field) |
+                field1 + field2 | field * n
+    """
     result = data
     for line in code.strip().split("\n"):
         line = line.strip()
         if not line or line.startswith("#"):
             continue
-        # Simple assignment: result = expr
         if line.startswith("result = "):
             expr = line[9:].strip()
-            result = _eval_safe_expr(expr, data)
+            result = _safe_eval(expr, data)
         else:
-            result = _eval_safe_expr(line, data)
+            result = _safe_eval(line, data)
     return result
 
 
-def _eval_safe_expr(expr, data):
-    """Evaluate a safe expression with data context."""
-    # Resolve template variables first
-    for key, val in data.items():
-        expr = expr.replace(f"${{{key}}}", repr(val))
-        expr = expr.replace(f"${key}", repr(val))
-    # Only allow safe operations — no __builtins__
+def _safe_eval(expr, data):
+    """Evaluate a safe expression. Only string/number ops allowed."""
+    expr = expr.strip()
+
+    # Resolve ${var} and $var template references
+    for key in sorted(data.keys(), key=len, reverse=True):
+        val = data[key]
+        expr = expr.replace(f"${{{key}}}", str(val))
+        expr = expr.replace(f"${key}", str(val))
+
+    # Handle pipe operations: field.upper, field.lower, etc.
+    pipe_ops = {
+        "upper": str.upper,
+        "lower": str.lower,
+        "strip": str.strip,
+        "title": str.title,
+    }
+    for op_name, op_fn in pipe_ops.items():
+        if f".{op_name}" in expr:
+            parts = expr.rsplit(f".{op_name}", 1)
+            if len(parts) == 2 and (not parts[1] or parts[1].startswith("()")):
+                val = _resolve_value(parts[0].strip(), data)
+                return op_fn(str(val)) if val is not None else ""
+
+    # Handle function calls: len(x), int(x), str(x), float(x), bool(x)
+    func_ops = {
+        "len": len, "int": int, "str": str, "float": float, "bool": bool,
+        "abs": abs, "round": round, "min": min, "max": max, "sum": sum,
+    }
+    for func_name, func_fn in func_ops.items():
+        if expr.startswith(f"{func_name}(") and expr.endswith(")"):
+            inner = expr[len(func_name)+1:-1].strip()
+            val = _resolve_value(inner, data)
+            try:
+                return func_fn(val)
+            except Exception:
+                return None
+
+    # Handle concatenation: "hello" + " " + "world" or field1 + field2
+    if " + " in expr:
+        parts = expr.split(" + ")
+        resolved = [_resolve_value(p.strip(), data) for p in parts]
+        if all(r is not None for r in resolved):
+            # If any part is numeric, try numeric addition
+            try:
+                nums = [float(r) for r in resolved]
+                result = sum(nums)
+                return int(result) if result == int(result) else result
+            except (ValueError, TypeError):
+                return "".join(str(r) for r in resolved)
+
+    # Handle multiplication: field * n
+    if " * " in expr:
+        parts = expr.split(" * ")
+        if len(parts) == 2:
+            val = _resolve_value(parts[0].strip(), data)
+            try:
+                return float(val) * float(parts[1].strip())
+            except (ValueError, TypeError):
+                return val
+
+    # Simple value resolution
+    val = _resolve_value(expr, data)
+    if val is not None:
+        return val
+
+    # Return as-is if nothing matched
+    return expr
+
+
+def _resolve_value(expr, data):
+    """Resolve a value from data dict. Supports dot notation: user.name"""
+    expr = expr.strip()
+    # String literal
+    if (expr.startswith('"') and expr.endswith('"')) or \
+       (expr.startswith("'") and expr.endswith("'")):
+        return expr[1:-1]
+    # Numeric literal
     try:
-        return eval(expr, {"__builtins__": {}, **_SAFE_OPS}, {})
-    except Exception:
-        return expr
+        return int(expr)
+    except ValueError:
+        try:
+            return float(expr)
+        except ValueError:
+            pass
+    # Boolean / None
+    if expr == "True": return True
+    if expr == "False": return False
+    if expr == "None": return None
+    # Data lookup (dot notation)
+    keys = expr.split(".")
+    val = data
+    for k in keys:
+        if isinstance(val, dict):
+            val = val.get(k)
+        else:
+            return None
+    return val
 
 
 # ─── Action Router ────────────────────────────────────────
@@ -331,18 +400,59 @@ def run_actions(actions, data):
 
 
 def evaluate_condition(condition, data):
-    """Evaluate simple conditions safely: key == value, key > value, etc."""
+    """Evaluate simple conditions safely (NO eval).
+    Supports: key == value, key != value, key > value, key < value,
+              key >= value, key <= value, key contains value
+    """
     try:
-        for key, val in data.items():
-            condition = condition.replace(f"${{{key}}}", repr(val))
-            condition = condition.replace(f"${key}", repr(val))
-        # Safe eval with no builtins
-        return bool(eval(condition, {"__builtins__": {
-            "True": True, "False": False, "None": None,
-            "len": len, "str": str, "int": int, "float": float,
-            "bool": bool, "list": list, "dict": dict, "set": set,
-            "type": type, "isinstance": isinstance,
-        }}, {}))
+        # Resolve ${var} and $var template references
+        cond = condition.strip()
+        for key in sorted(data.keys(), key=len, reverse=True):
+            val = data[key]
+            cond = cond.replace(f"${{{key}}}", str(val))
+            cond = cond.replace(f"${key}", str(val))
+
+        # Parse comparison operators
+        import re
+        # Match: operand1 operator operand2
+        match = re.match(r'^\s*(.+?)\s*(==|!=|>=|<=|>|<|contains)\s*(.+?)\s*$', cond)
+        if not match:
+            return False
+        left_str, op, right_str = match.groups()
+        left_str = left_str.strip()
+        right_str = right_str.strip()
+
+        # Resolve values
+        left = _resolve_value(left_str, data)
+        right = _resolve_value(right_str, data)
+        # If a side resolved to None, treat it as a literal string
+        if left is None:
+            left = left_str
+        if right is None:
+            right = right_str
+
+        # Try numeric comparison first
+        try:
+            left_num = float(left) if left is not None else None
+            right_num = float(right) if right is not None else None
+            if left_num is not None and right_num is not None:
+                if op == "==": return left_num == right_num
+                if op == "!=": return left_num != right_num
+                if op == ">":  return left_num > right_num
+                if op == "<":  return left_num < right_num
+                if op == ">=": return left_num >= right_num
+                if op == "<=": return left_num <= right_num
+        except (ValueError, TypeError):
+            pass
+
+        # String comparison
+        left_s = str(left) if left is not None else ""
+        right_s = str(right) if right is not None else ""
+        if op == "==": return left_s == right_s
+        if op == "!=": return left_s != right_s
+        if op == "contains": return right_s in left_s
+
+        return False
     except Exception:
         return False
 
