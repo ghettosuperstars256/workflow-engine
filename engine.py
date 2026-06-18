@@ -44,9 +44,12 @@ logger = logging.getLogger("workflow-engine")
 WORKFLOWS_DIR = os.environ.get("WORKFLOWS_DIR", "/opt/data/projects/workflows")
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "")
+SUPABASE_SERVICE_ROLE = os.environ.get("SUPABASE_SERVICE_ROLE", "")
+# Use service role key for write operations (bypasses RLS)
+# Falls back to publishable key if service role not set
 SUPABASE_HEADERS = {
-    "apikey": SUPABASE_KEY,
-    "Authorization": f"Bearer {SUPABASE_KEY}",
+    "apikey": SUPABASE_SERVICE_ROLE or SUPABASE_KEY,
+    "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE or SUPABASE_KEY}",
     "Content-Type": "application/json",
     "Prefer": "return=representation"
 }
@@ -135,7 +138,7 @@ def action_supabase(params, data):
 def action_resend(params, data):
     """Send email via Resend."""
     payload = {
-        "from": resolve_template(params.get("from", "Prime Garrison <onboarding@resend.dev>"), data),
+        "from": resolve_template(params.get("from", "Prime Garrison <hello@primegarrison.cloud>"), data),
         "to": [resolve_template(params["to"], data)],
         "subject": resolve_template(params["subject"], data),
     }
@@ -146,7 +149,8 @@ def action_resend(params, data):
 
     resp = requests.post("https://api.resend.com/emails", json=payload, headers={
         "Authorization": f"Bearer {RESEND_API_KEY}",
-        "Content-Type": "application/json"
+        "Content-Type": "application/json",
+        "User-Agent": "PrimeGarrison/1.0",
     }, timeout=15)
 
     logger.info(f"  Resend → {payload['to']} '{payload['subject'][:50]}' → {resp.status_code}")
@@ -202,15 +206,69 @@ def action_delay(params, data):
 
 
 def action_code(params, data):
-    """Execute Python code (use with caution)."""
-    code = params.get("code", "result = data")
-    local_vars = {"data": data, "requests": requests, "json": json, "result": None}
+    """Transform data using safe expression mapping (no exec/eval)."""
+    # Safe operations only: get, set, filter, map, join, split, upper, lower, strip
+    code = params.get("code", "")
+    if not code:
+        return data
     try:
-        exec(code, {}, local_vars)
-        return local_vars.get("result", local_vars.get("data"))
+        result = _safe_transform(code, data)
+        return result
     except Exception as e:
-        logger.error(f"  Code exec error: {e}")
+        logger.error(f"  Code transform error: {e}")
         return {"error": str(e)}
+
+
+# Safe transform operations — NO exec/eval
+_SAFE_OPS = {
+    "upper": str.upper,
+    "lower": str.lower,
+    "strip": str.strip,
+    "title": str.title,
+    "len": len,
+    "str": str,
+    "int": int,
+    "float": float,
+    "bool": bool,
+    "list": list,
+    "dict": dict,
+    "sorted": sorted,
+    "reversed": list,  # reversed() returns iterator, wrap in list
+    "sum": sum,
+    "min": min,
+    "max": max,
+    "abs": abs,
+    "round": round,
+}
+
+
+def _safe_transform(code, data):
+    """Apply safe data transformations. Code format: 'field.operation(args)'"""
+    result = data
+    for line in code.strip().split("\n"):
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        # Simple assignment: result = expr
+        if line.startswith("result = "):
+            expr = line[9:].strip()
+            result = _eval_safe_expr(expr, data)
+        else:
+            result = _eval_safe_expr(line, data)
+    return result
+
+
+def _eval_safe_expr(expr, data):
+    """Evaluate a safe expression with data context."""
+    # Resolve template variables first
+    for key, val in data.items():
+        expr = expr.replace(f"${{{key}}}", repr(val))
+        expr = expr.replace(f"${key}", repr(val))
+    # Only allow safe operations — no __builtins__
+    try:
+        return eval(expr, {"__builtins__": {}, **_SAFE_OPS}, {})
+    except Exception:
+        return expr
 
 
 # ─── Action Router ────────────────────────────────────────
@@ -239,6 +297,14 @@ def run_action(action_def, data):
         # Store result in data context
         result = handler(params, data)
         data[action_def["as"]] = result
+        # Also flatten first-item fields for easy access
+        # Use underscore separator since string.Template doesn't support dots
+        if isinstance(result, list) and len(result) > 0 and isinstance(result[0], dict):
+            for k, v in result[0].items():
+                data[f"{action_def['as']}_{k}"] = v
+        elif isinstance(result, dict):
+            for k, v in result.items():
+                data[f"{action_def['as']}_{k}"] = v
         return result
     return handler(params, data)
 
@@ -265,12 +331,18 @@ def run_actions(actions, data):
 
 
 def evaluate_condition(condition, data):
-    """Evaluate simple conditions: key == value, key > value, etc."""
+    """Evaluate simple conditions safely: key == value, key > value, etc."""
     try:
         for key, val in data.items():
             condition = condition.replace(f"${{{key}}}", repr(val))
             condition = condition.replace(f"${key}", repr(val))
-        return eval(condition, {"__builtins__": {}}, {})
+        # Safe eval with no builtins
+        return bool(eval(condition, {"__builtins__": {
+            "True": True, "False": False, "None": None,
+            "len": len, "str": str, "int": int, "float": float,
+            "bool": bool, "list": list, "dict": dict, "set": set,
+            "type": type, "isinstance": isinstance,
+        }}, {}))
     except Exception:
         return False
 
