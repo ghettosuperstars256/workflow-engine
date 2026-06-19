@@ -24,6 +24,7 @@ import os
 import sys
 import json
 import time
+import subprocess
 import yaml
 import requests
 import logging
@@ -106,7 +107,10 @@ def action_http(params, data):
 
     resp = requests.request(method, url, headers=headers, data=body, json=json_body, timeout=30)
     logger.info(f"  HTTP {method} {url} → {resp.status_code}")
-    return resp.json() if "application/json" in resp.headers.get("Content-Type", "") else resp.text
+    content_type = resp.headers.get("Content-Type", "")
+    if "application/json" in content_type:
+        return resp.json()
+    return {"status_code": resp.status_code, "body": resp.text[:500]}
 
 
 def action_supabase(params, data):
@@ -206,15 +210,34 @@ def action_delay(params, data):
 
 
 def action_code(params, data):
-    """Transform data using safe expression mapping (NO eval/exec)."""
+    """Execute code in a subprocess. Runs Python code with data as JSON stdin."""
     code = params.get("code", "")
     if not code:
         return data
     try:
-        result = _safe_transform(code, data)
-        return result
+        # Pass data as JSON via stdin to the Python subprocess
+        input_json = json.dumps(data)
+        result = subprocess.run(
+            [sys.executable, "-c", code],
+            input=input_json,
+            capture_output=True,
+            text=True,
+            timeout=60,
+            env={**os.environ, "INPUT_JSON": input_json}
+        )
+        if result.returncode != 0:
+            logger.error(f"  Code exec error: {result.stderr[:300]}")
+            return {"error": result.stderr[:200]}
+        # Try to parse stdout as JSON, fall back to raw string
+        try:
+            return json.loads(result.stdout.strip())
+        except (json.JSONDecodeError, ValueError):
+            return result.stdout.strip()
+    except subprocess.TimeoutExpired:
+        logger.error("  Code exec timeout")
+        return {"error": "Code execution timed out"}
     except Exception as e:
-        logger.error(f"  Code transform error: {e}")
+        logger.error(f"  Code exec error: {e}")
         return {"error": str(e)}
 
 
@@ -394,7 +417,7 @@ def run_actions(actions, data):
             run_action(action_def, data)
         except Exception as e:
             logger.error(f"  Action failed: {e}")
-            if action_def.get("params", {}).get("stop_on_error", True):
+            if action_def.get("stop_on_error", True):
                 return data
     return data
 
