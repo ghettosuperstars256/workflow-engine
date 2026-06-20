@@ -210,15 +210,30 @@ def action_delay(params, data):
 
 
 def action_code(params, data):
-    """Execute code in a subprocess. Runs Python code with data as JSON stdin."""
+    """Execute code in a subprocess. Runs Python code with data as JSON stdin.
+    Supports multi-line code by writing to a temp file (Python -c only handles single-line).
+    """
+    import tempfile
     code = params.get("code", "")
     if not code:
         return data
+    tmp_path = None
     try:
-        # Pass data as JSON via stdin to the Python subprocess
+        # Write multi-line code to a temp file instead of using -c (single-line only)
         input_json = json.dumps(data)
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False, prefix="wf_code_") as tmp:
+            tmp_path = tmp.name
+            # Write code that reads data from stdin or INPUT_JSON env var
+            tmp.write("import os, json, sys\n")
+            tmp.write("_input = os.environ.get('INPUT_JSON', '')\n")
+            tmp.write("if not _input and not sys.stdin.isatty():\n")
+            tmp.write("    _input = sys.stdin.read()\n")
+            tmp.write("data = json.loads(_input) if _input else {}\n")
+            tmp.write(code)
+            tmp.write("\nif 'result' in dir():\n")
+            tmp.write("    print(json.dumps(result) if isinstance(result, (dict, list)) else str(result))\n")
         result = subprocess.run(
-            [sys.executable, "-c", code],
+            [sys.executable, tmp_path],
             input=input_json,
             capture_output=True,
             text=True,
@@ -226,8 +241,10 @@ def action_code(params, data):
             env={**os.environ, "INPUT_JSON": input_json}
         )
         if result.returncode != 0:
-            logger.error(f"  Code exec error: {result.stderr[:300]}")
-            return {"error": result.stderr[:200]}
+            stderr_msg = result.stderr[:300] if result.stderr else "(no stderr output)"
+            stdout_msg = result.stdout[:200] if result.stdout else ""
+            logger.error(f"  Code exec error: {stderr_msg} | stdout: {stdout_msg}")
+            return {"error": stderr_msg, "stdout": stdout_msg}
         # Try to parse stdout as JSON, fall back to raw string
         try:
             return json.loads(result.stdout.strip())
@@ -239,6 +256,13 @@ def action_code(params, data):
     except Exception as e:
         logger.error(f"  Code exec error: {e}")
         return {"error": str(e)}
+    finally:
+        # Clean up temp file
+        if tmp_path:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
 
 
 # ─── Safe Expression Evaluator ──────────────────────────────
