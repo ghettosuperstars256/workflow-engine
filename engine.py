@@ -553,7 +553,7 @@ def load_scheduled_workflows():
             with open(filepath, "r") as f:
                 workflow = yaml.safe_load(f)
 
-            if not workflow or "schedule" not in workflow:
+            if not workflow or not workflow.get("schedule"):
                 continue
 
             wf_name = filename.replace(".yaml", "").replace(".yml", "")
